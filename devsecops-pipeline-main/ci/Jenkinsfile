@@ -1,0 +1,192 @@
+// =====================================================================
+// DevSecOps CI/CD Pipeline - Declarative Jenkinsfile
+// Phase 4: checkout, test, docker build
+// (Phase 5 adds SonarQube SAST stage, Phase 6 adds Trivy security scan,
+//  Phase 7 adds ECR push, Phase 9 adds Kubernetes deploy)
+// =====================================================================
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        APP_DIR        = 'app'
+        IMAGE_NAME     = 'devsecops-demo'
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"
+        VENV_DIR       = '.venv'
+        SONAR_HOST_URL = 'http://172.17.0.1:9000'
+        SONAR_SCANNER  = '/opt/sonar-scanner/bin/sonar-scanner'
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '649966627060'
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO       = "${ECR_REGISTRY}/${IMAGE_NAME}"
+    }
+
+    stages {
+
+        stage('Checkout info') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== Build #${BUILD_NUMBER} on ${NODE_NAME} ==="
+                    echo "=== Commit ==="
+                    git log --oneline -1
+                    echo ""
+                    echo "=== Workspace contents ==="
+                    ls -la
+                '''
+            }
+        }
+
+        stage('Python setup') {
+            steps {
+                dir("${APP_DIR}") {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+                        python3 -m venv ${VENV_DIR}
+                        . ${VENV_DIR}/bin/activate
+                        python -m pip install --upgrade pip --quiet
+                        pip install -r requirements-dev.txt --quiet
+                        echo "Installed packages:"
+                        pip list
+                    '''
+                }
+            }
+        }
+
+        stage('Unit tests') {
+            steps {
+                dir("${APP_DIR}") {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+                        . ${VENV_DIR}/bin/activate
+                        pytest --junit-xml=test-results.xml --cov-report=xml:coverage.xml
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: false, testResults: "${APP_DIR}/test-results.xml"
+                }
+            }
+        }
+
+        stage('SonarQube SAST') {
+            steps {
+                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+                        ${SONAR_SCANNER} \
+                            -Dsonar.host.url=${SONAR_HOST_URL} \
+                            -Dsonar.token=${SONAR_TOKEN}
+                    '''
+                }
+            }
+        }
+
+        stage('Trivy filesystem scan') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== Trivy fs: scanning workspace for vulnerable deps + secrets + misconfig ==="
+                    trivy fs \
+                        --scanners vuln,secret,misconfig \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code 1 \
+                        --format table \
+                        --no-progress \
+                        .
+                '''
+            }
+        }
+
+        stage('Docker build') {
+            steps {
+                dir("${APP_DIR}") {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+                        docker build \
+                            --pull \
+                            --tag ${IMAGE_NAME}:${IMAGE_TAG} \
+                            --tag ${IMAGE_NAME}:latest \
+                            --label "build.number=${BUILD_NUMBER}" \
+                            --label "build.commit=$(git rev-parse --short HEAD)" \
+                            .
+                        echo ""
+                        echo "=== Image built ==="
+                        docker images ${IMAGE_NAME} --format '{{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedSince}}'
+                    '''
+                }
+            }
+        }
+
+        stage('Trivy image scan') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== Trivy image: scanning ${IMAGE_NAME}:${IMAGE_TAG} for OS + lang CVEs ==="
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code 1 \
+                        --format table \
+                        --no-progress \
+                        ${IMAGE_NAME}:${IMAGE_TAG}
+                '''
+            }
+        }
+
+        stage('ECR login') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== Logging in to ECR ${ECR_REGISTRY} (IMDS role-based auth) ==="
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                        | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                '''
+            }
+        }
+
+        stage('ECR push') {
+            steps {
+                sh '''#!/bin/bash
+                    set -euo pipefail
+                    echo "=== Tag image for ECR ==="
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REPO}:latest
+
+                    echo "=== Push ${ECR_REPO}:${IMAGE_TAG} ==="
+                    docker push ${ECR_REPO}:${IMAGE_TAG}
+                    docker push ${ECR_REPO}:latest
+
+                    echo "=== Image in ECR ==="
+                    aws ecr describe-images \
+                        --repository-name ${IMAGE_NAME} \
+                        --region ${AWS_REGION} \
+                        --query 'sort_by(imageDetails,&imagePushedAt)[-3:].{Tags:imageTags,Digest:imageDigest,Size:imageSizeInBytes,Pushed:imagePushedAt}' \
+                        --output table
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Build #${env.BUILD_NUMBER} SUCCEEDED. Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+        }
+        failure {
+            echo "Build #${env.BUILD_NUMBER} FAILED. Check stage logs above."
+        }
+        always {
+            // Clean workspace to save disk on t3.micro
+            cleanWs(deleteDirs: true, notFailBuild: true)
+        }
+    }
+}
